@@ -1,6 +1,16 @@
 #!/bin/bash 
 # used in converage html generation for golang project
 # put this shell in project's dir 
+# Download gocov
+#go get  github.com/axw/gocov/gocov
+#go get github.com/matm/gocov-html
+#on terminal 
+#gocov test | gocov report
+#on html 
+#gocov test | gocov-html > coverage.html
+#
+#
+#
 
 ROOT_DIR=`pwd`/../ # project's ROOT DIR 
 COVERAGE_FILE=`pwd`/coverage.html # filepath to put converage 
