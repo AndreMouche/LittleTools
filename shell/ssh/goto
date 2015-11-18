@@ -1,0 +1,22 @@
+#!/bin/bash
+gotohosts="./hosts"
+function help() {
+    echo "Usage:$0 host";
+    echo "Avaiable hostlist:"
+    awk -F" " '{printf("%s\t-- %s",$2,$1);if($NF>4)printf(" (%s) ",$4);printf("\n");}' $gotohosts
+    exit -1
+}
+
+if [ "$#" != "1" ];then
+   help 
+fi
+thehost=$1
+cmd=`awk -F" " '{if($1=="'$thehost'") printf("%s@%s",$3,$2)}' $gotohosts`
+#cmd=`awk -F" " '{print ENVIRON["thehost"];if($1=="$thehost") printf("%s@%s",$3,$2)}' $gotohosts`;
+#echo "cmd", $cmd 
+if [ "$cmd" == "" ]; then 
+    echo "Illega host:"$thehost
+    help
+fi
+ssh $cmd
+#ssh ubuntu@$1
