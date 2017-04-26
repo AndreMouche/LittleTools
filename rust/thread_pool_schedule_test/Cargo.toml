@@ -1,0 +1,9 @@
+[package]
+
+name = "thread_schedule_test"
+version = "0.0.1"
+authors = [ "shirly <shirly@example.com>" ]
+
+[dependencies]
+ordermap="0.2"
+threadpool = "1.0.0"
