@@ -27,7 +27,8 @@ tls = ''
 parser = argparse.ArgumentParser(description='Compact TiKV regions by store ID or all stores in parallel.')
 parser.add_argument('--pd', type=str, default='127.0.0.1:2379', help='PD address (default:127.0.0.1:2379)')
 parser.add_argument('--version', type=str, default='v7.5.2', help='TiKV version (default:v7.5.2)') 
-parser.add_argument('--store-id', type=int, default="invalid", help='Store ID to process (default:invalid.) 0 means process all stores in parallel)') 
+parser.add_argument('--store-id', type=int, default="-1", help='Store ID to process (default:-1. list storeinfo only) 0 means process all stores in parallel ') 
+parser.add_argument('--start-key', type=str, default="", help='Start key for regions to compact (default: empty string)')
 parser.add_argument('--concurrency', "-c",type=int, default=2, help='Number of concurrent threads per store (default:2)')
 
 args = parser.parse_args()
@@ -85,13 +86,13 @@ class Statistics:
 
 
 class TiKVStore:
-    def __init__(self, store_id, address):
+    def __init__(self, store_id, address,start_key):
         self.store_id = store_id
         self.address = address
         self.statitics = Statistics() 
         self.start_time = time.time() 
-        self.start_key = "" 
         self.start_lock = threading.Lock()
+        self.start_key = start_key
         self.finished = False
 
     def load_next_batch_regions(self):
@@ -161,8 +162,8 @@ class TiKVStore:
             logger.debug(f"mvcc.num_rows: {result_dict['mvcc.num_rows']}")
             logger.debug(f"writecf.num_deletes: {result_dict['writecf.num_deletes']}")
             logger.debug(f"writecf.num_entries: {result_dict['writecf.num_entries']}")
-            
-            if (float(result_dict['mvcc.num_deletes']) / float(result_dict['mvcc.num_rows']) > .2 or
+            redundant_versions = float(result_dict['writecf.num_entries']) - float(result_dict['mvcc.num_rows']) + float(result_dict['mvcc.num_deletes']) 
+            if (float(redundant_versions) / float(result_dict['writecf.num_entries']) > .2 or
                 float(result_dict['writecf.num_deletes']) / float(result_dict['writecf.num_entries']) > .2):
                 self.statitics.add_compact()
                 start_time = time.time()
@@ -194,7 +195,7 @@ class TiKVStore:
             else:
                 self.statitics.add_skip() 
                 logger.info(f"No need to compact {self.address} region {region_id}")
-                return Flase 
+                return False 
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to process region {region_id} on {self.address}: {e.stderr}")
             return False 
@@ -203,7 +204,8 @@ class TiKVStore:
     def process_in_one_thread(self, thread_id): 
         total = 0
         compacted = 0 
-        logger.info(f"{self.store_id}_thread_{thread_id}:Thread {thread_id} started processing store {self.store_id}.")
+        thread_prefix = f"{self.store_id}_thread_{thread_id}" 
+        logger.info(f"{thread_prefix}:Thread {thread_id} started processing store {self.store_id}.")
         try:  
             while True:
                 regions = self.load_next_batch_regions()
@@ -211,14 +213,14 @@ class TiKVStore:
                     break
                 total += len(regions) 
                 for region_id in regions:
-                    logger.info(f"{self.store_id}_thread_{thread_id}: Processing region {region_id} on store {self.store_id}")
+                    logger.info(f"{thread_prefix}: Processing region {region_id} on store {self.store_id}")
                     if self.check_and_compact_one_region(region_id):
                         compacted += 1 
-                logger.info(f"{self.store_id}_thread_{thread_id}: Processed {len(regions)} regions for store {self.store_id},compacted {compacted} regions so far." )
+                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},compacted {compacted} regions so far." )
         except Exception as e:
-            logger.error(f"{self.store_id}_thread_{thread_id}:Unexpected error while processing store {self.store_id}: {e}")
+            logger.error(f"{thread_prefix}:Unexpected error while processing store {self.store_id}: {e}")
         finally:     
-            logger.info(f"{self.store_id}_thread_{thread_id}: Finished processing store {self.store_id}. Total regions processed: {total}, compacted: {compacted}")
+            logger.warning(f"{thread_prefix}: Finished processing store {self.store_id}. Total regions processed: {total}, compacted: {compacted}")
 
     def check_and_compact_with_concurrency(self, concurrency=2):
         try:
@@ -233,9 +235,9 @@ class TiKVStore:
         except Exception as e:
             logger.warning(f"check_and_compact_with_concurrency:Unexpected error: {e}")
         finally:
-            logger.info(f"Finished processing store {self.store_id}. Total regions processed: {self.statitics.checked_regions}, compacted: {self.statitics.compact_regions}, skipped: {self.statitics.skipped_regions}, properties failed: {self.statitics.get_properties_failed()}")
+            logger.warning(f"Finished processing store {self.store_id}. Total regions processed: {self.statitics.checked_regions}, compacted: {self.statitics.compact_regions}, skipped: {self.statitics.skipped_regions}, properties failed: {self.statitics.get_properties_failed()}")
 
-def new_tikv_store_from_json(store_data):
+def new_tikv_store_from_json(store_data,start_key):
     store = store_data["store"]
     store_id = store.get("id")
     store_address = store.get("address") 
@@ -247,18 +249,18 @@ def new_tikv_store_from_json(store_data):
             break 
     if label == "tiflash":
         logger.warning(f"Skipping store {store_id} with address {store_address} as it is a TiFlash store.")
-        return 
+        return None
     logger.info(f"New TiKV store {store_id} , address {store_address}, region count {region_count}") 
-    return TiKVStore(store_id, store_address)
+    return TiKVStore(store_id, store_address,start_key)
 
-def process_one_store(store_id, concurrency): 
+def process_one_store(store_id, concurrency,start_key): 
     logger.info(f"Processing store {store_id} with concurrency {concurrency}") 
     try:
         cmd = f'tiup ctl:{version} pd -u {pd} {tls} store {store_id}'
         logger.info(f"Running command: {cmd}") 
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         store_data = json.loads(result.stdout)
-        tikv_store = new_tikv_store_from_json(store_data)
+        tikv_store = new_tikv_store_from_json(store_data,start_key)
         if not tikv_store:
             logger.warning(f"Store {store_id} is a TiFlash store or not found, skipping.")
             return
@@ -272,7 +274,7 @@ def process_one_store(store_id, concurrency):
     
 
 # Function to compact all stores in parallel
-def compact_all_stores():
+def compact_all_stores(start_key,check_stores_only):
     logger.info("Compacting all stores...") 
     try:
         cmd = f'tiup ctl:{version} pd -u {pd} {tls} store'
@@ -296,10 +298,12 @@ def compact_all_stores():
 
         stores = []
         for store_info in data.get("stores", []):
-            store = new_tikv_store_from_json(store_info)
+            store = new_tikv_store_from_json(store_info,start_key)
             if store:
                 stores.append(store) 
 
+        if check_stores_only: 
+            return
         logger.info(f"Found {len(stores)} stores.We will process them in parallel.") 
         #ask = questionary.confirm("Do you want to continue?").ask()
         #if not ask:
@@ -325,8 +329,19 @@ def compact_all_stores():
 
 
 if __name__ == "__main__":
-    store_id = args.store_id
-    if store_id > 0:
-        process_one_store(store_id, thread_per_store)
+    store_id = args.store_id    
+    start_key = args.start_key
+    if start_key:
+        logger.info(f"Using start key: {start_key}")
     else:
-        compact_all_stores() 
+        logger.info("No start key provided, will start from the beginning.")
+    if  store_id < 0:
+        compact_all_stores(start_key,check_stores_only=True)
+        logger.error("Invalid store ID provided. Please provide a valid store ID or 0 to compact all stores.")
+        sys.exit(1)
+    if store_id > 0:
+        logger.info(f"Processing single store with ID: {store_id}")
+        process_one_store(store_id, thread_per_store,start_key)
+    else: 
+        logger.info("Processing all stores in parallel.")
+        compact_all_stores(start_key,check_stores_only=False) 
