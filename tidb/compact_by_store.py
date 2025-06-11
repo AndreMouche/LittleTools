@@ -245,11 +245,12 @@ def new_tikv_store_from_json(store_data,start_key):
     labels = store.get("labels", []);
     for label in labels:
         if label.get("key") == "engine":
-            label = label.get("value", "unknown")
-            break 
-    if label == "tiflash":
-        logger.warning(f"Skipping store {store_id} with address {store_address} as it is a TiFlash store.")
-        return None
+            label = label.get("value", "unknown") 
+            if label == "tiflash":
+                logger.warning(f"Skipping store {store_id} with address {store_address} as it is a TiFlash store.")
+                return None
+            else:
+                break
     logger.info(f"New TiKV store {store_id} , address {store_address}, region count {region_count}") 
     return TiKVStore(store_id, store_address,start_key)
 
