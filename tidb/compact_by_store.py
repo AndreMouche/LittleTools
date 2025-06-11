@@ -102,7 +102,7 @@ class TiKVStore:
                 return None
             # Load next batch of regions from TiKV store 
             # tiup ctl:v7.5.2 tikv --host '127.0.0.1:20161' raft region  --start="7480000000000000FF0C00000000000000F8"
-            cmd = f'tiup ctl:{version} tikv --host {self.address} raft region --start="{self.start_key}"'
+            cmd = f'tiup ctl:{version} tikv --host {self.address} raft region --start="{self.start_key}" --limit=100'
             logger.info(f"Running command to load next regions: {cmd}") 
             result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
             regions_data = json.loads(result.stdout)
