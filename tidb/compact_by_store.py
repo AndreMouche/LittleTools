@@ -98,14 +98,14 @@ class RegionProperties:
             return False
 
 # Function to get region properties from TiKV store
-def new_region_properties(region_id,store_address):
+def new_region_properties(region_id,store_address,thread_prefix):
     # Get region properties from TiKV store
     try:
         cmd = f'{tikv_ctl}  --host {store_address} region-properties -r {region_id}'
-        logger.debug(f"Running command to get region properties for {region_id}: {cmd}") 
+        logger.debug(f"{thread_prefix} Running command to get region properties for {region_id}: {cmd}") 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) 
         if result.returncode != 0:
-            logger.error(f"Failed to get region properties for {region_id} on {store_address}: {result.stderr}")
+            logger.error(f"{thread_prefix} Failed to get region properties for {region_id} on {store_address}: {result.stderr}")
             return None
         
         result_dict = {}
@@ -123,7 +123,7 @@ def new_region_properties(region_id,store_address):
             float(result_dict['writecf.num_entries'])
         )
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to get region properties for {region_id} on {store_address}: {e.stderr}")
+        logger.error(f"{thread_prefix} Failed to get region properties for {region_id} on {store_address}: {e.stderr}")
         return None 
 
 class TiKVStore:
@@ -136,32 +136,33 @@ class TiKVStore:
         self.start_key = start_key
         self.finished = False
 
-    def load_next_batch_regions(self):
+    def load_next_batch_regions(self,thread_prefix):
         self.start_lock.acquire()
         try:
             if self.finished == True: 
-                logger.info(f"Store {self.store_id} has finished processing.")
+                logger.info(f"{thread_prefix} Store {self.store_id} has finished processing.")
                 return None
             # Load next batch of regions from TiKV store 
             # tiup ctl:v7.5.2 tikv --host '127.0.0.1:20161' raft region  --start="7480000000000000FF0C00000000000000F8"
             #  /opt/other-binary/tikv-ctl   --ca-path ./tls/ca.crt --cert-path ./tls/tls.crt --key-path ./tls/tls.key --host db-tikv-2.db-tikv-peer.tidb10121348356836280592.svc:20160  raft region --start="" --limit=100
-            cmd = f'{tikv_ctl}  --host {self.address} raft region --start="{self.start_key}" --limit=100'
-            logger.info(f"Running command to load next regions: {cmd}") 
+            cmd = f'{tikv_ctl}  --host {self.address} raft region --skip-tombstone --start="{self.start_key}" --limit=100' 
+            logger.info(f"{thread_prefix} Running command to load next regions: {cmd}") 
+
             result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
             regions_data = json.loads(result.stdout)
             if not regions_data or not regions_data.get("region_infos"):
                 self.finished = True 
-                logger.info(f"No more regions to process for store {self.store_id}.")
+                logger.info(f"{thread_prefix} No more regions to process for store {self.store_id}.")
                 return None 
             
             region_ids = []
             for region_id,region_info in regions_data.get("region_infos").items():
                 region = region_info.get("region_local_state", {}).get("region",{})
-                logger.debug(f"region:{region}")
+                logger.debug(f"{thread_prefix} region:{region}")
                 self.start_key = region.get("end_key")  # Update start_key for next batch
                 state = region.get("state", {})
                 if state  != "Normal":
-                    logger.debug(f"Skipping region {region_id} in store {self.store_id} due to state: {state}")
+                    logger.debug(f"{thread_prefix} Skipping region {region_id} in store {self.store_id} due to state: {state}")
                     continue
                 if region_id:
                     region_ids.append(region_id)
@@ -169,39 +170,39 @@ class TiKVStore:
                 
             if self.start_key == "":
                 self.finished = True 
-            logger.info(f"Loaded {len(region_ids)} regions for store {self.store_id} next start-key {self.start_key}.")
+            logger.info(f"{thread_prefix} Loaded {len(region_ids)} regions for store {self.store_id} next start-key {self.start_key}.")
         
             return region_ids 
         except subprocess.CalledProcessError as e:
-            logger.warning(f"Command failed with error:\n{e.stderr}")
+            logger.warning(f"{thread_prefix} Command failed with error:\n{e.stderr}")
             self.finished = True
         except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON output.")
+            logger.warning("{thread_prefix} Failed to parse JSON output.")
             self.finished = True
         except Exception as e:
-            logger.warning(f"maybe no more regions:Unexpected error: {e}")
+            logger.warning(f"{thread_prefix} maybe no more regions:Unexpected error: {e}")
             self.finished = True
         finally:
             self.start_lock.release()
     
-    def compact_one_region(self,region_id):
+    def compact_one_region(self,region_id,thread_prefix):
         self.statitics.add_compact()
         start_time = time.time()
         def compact_one_cf(cf):
             try:
                 compact_cmd = f'{tikv_ctl}  --host {self.address} compact --bottommost force -c {cf} -r {region_id}'
-                logger.debug(f"Running command to compact {cf} CF for region {region_id}: {compact_cmd}")
+                logger.debug(f"{thread_prefix} Running command to compact {cf} CF for region {region_id}: {compact_cmd}")
                 result = subprocess.run(compact_cmd, 
                             shell=True,                 
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
                 if result.returncode != 0:
-                    logger.error(f"Failed to compact {cf} CF for region {region_id} on {self.address}: {result.stderr}")
+                    logger.error(f"{thread_prefix} Failed to compact {cf} CF for region {region_id} on {self.address}: {result.stderr}")
                     return False
-                logger.debug(f"Compact {cf} CF for region {region_id} on {self.address} completed successfully.{result.stdout}")
+                logger.debug(f"{thread_prefix} Compact {cf} CF for region {region_id} on {self.address} completed successfully.{result.stdout}")
                 return True
             except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to compact {cf} CF for region {region_id} on {self.address}: {e.stderr}")
+                logger.error(f"{thread_prefix} Failed to compact {cf} CF for region {region_id} on {self.address}: {e.stderr}")
                 return False 
 
         write_cf = compact_one_cf("write") 
@@ -210,26 +211,26 @@ class TiKVStore:
         logger.info(f"Compacted region {region_id} on {self.address} in {end_time - start_time:.3f} seconds. Result: Write CF: {write_cf}, Default CF: {default_cf}")
             
 
-    def check_and_compact_one_region(self, region_id):
+    def check_and_compact_one_region(self, region_id,thread_prefix):
         try:
             self.statitics.add_checked() 
-            region_properties = new_region_properties(region_id, self.address) 
+            region_properties = new_region_properties(region_id, self.address,thread_prefix) 
             if not region_properties or region_properties.if_need_compact() == False: 
                 self.statitics.add_skip()
-                logger.info(f"Region {region_id} on {self.address} does not need compaction, skipping.")
+                logger.info(f"{thread_prefix} Region {region_id} on {self.address} does not need compaction, skipping.")
                 return False
-            self.compact_one_region(region_id) 
-            new_properties = new_region_properties(region_id, self.address) 
+            self.compact_one_region(region_id,thread_prefix) 
+            new_properties = new_region_properties(region_id, self.address,thread_prefix) 
             if not new_properties or new_properties.if_need_compact() == False:
                 return True 
 
             # TODO: check if need compact again 
             if new_properties.mvcc_num_deletes != region_properties.mvcc_num_deletes and new_properties.mvcc_num_deletes > 1000:
-                logger.warning(f"Region {region_id} on {self.address} still has {new_properties.mvcc_num_deletes} deletes after compaction, it may need further attention.")
-                self.compact_one_region(region_id) 
+                logger.warning(f"{thread_prefix} Region {region_id} on {self.address} still has {new_properties.mvcc_num_deletes} deletes after compaction, it may need further attention.")
+                self.compact_one_region(region_id,thread_prefix) 
             return True 
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to process region {region_id} on {self.address}: {e.stderr}")
+            logger.error(f"{thread_prefix} Failed to process region {region_id} on {self.address}: {e.stderr}")
             return False 
     
     
@@ -241,16 +242,16 @@ class TiKVStore:
         try:  
             while True:
                 start = time.time() 
-                regions = self.load_next_batch_regions()
+                regions = self.load_next_batch_regions(thread_prefix)
                 if not regions or len(regions) == 0: 
                     break
                 total += len(regions) 
                 for region_id in regions:
                     logger.info(f"{thread_prefix}: Processing region {region_id} on store {self.store_id}")
-                    if self.check_and_compact_one_region(region_id):
+                    if self.check_and_compact_one_region(region_id,thread_prefix):
                         compacted += 1 
                 cost = time.time() - start 
-                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},cost {cost:.3f }seconds, compacted {compacted} regions so far." )
+                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},cost {cost:.3f}seconds, compacted {compacted} regions so far." )
         except Exception as e:
             logger.error(f"{thread_prefix}:Unexpected error while processing store {self.store_id}: {e}")
         finally:     
@@ -277,6 +278,7 @@ def new_tikv_store_from_json(store_data,start_key):
     store_address = store.get("address") 
     region_count = store_data["status"].get("region_count") 
     labels = store.get("labels", []);
+    # TODO:skip tombstone // disconnect
     for label in labels:
         if label.get("key") == "engine":
             label = label.get("value", "unknown") 
@@ -312,7 +314,7 @@ def process_one_store(store_id, concurrency,start_key):
 def compact_all_stores(start_key,check_stores_only):
     logger.info("Compacting all stores...") 
     try:
-        cmd = f'{pd_ctl} -u {pd}  store'
+        cmd = f'{pd_ctl} -u {pd}  store --state="Up"'
         logger.info("Starting to get stores from PD")
         logger.info(f"Running command: {cmd}")
         # Run the shell command and capture the output
