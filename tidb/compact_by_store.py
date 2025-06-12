@@ -19,10 +19,6 @@ from threading import Thread
 #import questionary
 import threading
 
-# global variables
-cnt = {'total': 0, 'need compaction': 0, 'skipped': 0}
-tls = ''
-# tls = "--ca-path /path/to/ca.crt --cert-path /path/to/client.crt --key-path /path/to/client.pem"
 
 parser = argparse.ArgumentParser(description='Compact TiKV regions by store ID or all stores in parallel.')
 parser.add_argument('--pd', type=str, default='127.0.0.1:2379', help='PD address (default:127.0.0.1:2379)')
@@ -31,10 +27,16 @@ parser.add_argument('--store-id', type=int, default="-1", help='Store ID to proc
 parser.add_argument('--start-key', type=str, default="", help='Start key for regions to compact (default: empty string)')
 parser.add_argument('--concurrency', "-c",type=int, default=2, help='Number of concurrent threads per store (default:2)')
 
+
 args = parser.parse_args()
 pd = args.pd 
 version = args.version 
 thread_per_store = args.concurrency 
+
+#pd_ctl = " /opt/other-binary/pd-ctl  --cacert ./tls/ca.crt --cert ./tls/tls.crt --key ./tls/tls.key "
+#tikv_ctl = " /opt/other-binary/tikv-ctl --ca-path ./tls/ca.crt --cert-path ./tls/tls.crt --key-path ./tls/tls.key "
+tikv_ctl = f"tiup ctl:{version} tikv"
+pd_ctl = f"tiup ctl:{version} pd"
 
 
 
@@ -99,7 +101,7 @@ class RegionProperties:
 def new_region_properties(region_id,store_address):
     # Get region properties from TiKV store
     try:
-        cmd = f'tiup ctl:{version} tikv {tls} --host {store_address} region-properties -r {region_id}'
+        cmd = f'{tikv_ctl}  --host {store_address} region-properties -r {region_id}'
         logger.debug(f"Running command to get region properties for {region_id}: {cmd}") 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) 
         if result.returncode != 0:
@@ -142,7 +144,8 @@ class TiKVStore:
                 return None
             # Load next batch of regions from TiKV store 
             # tiup ctl:v7.5.2 tikv --host '127.0.0.1:20161' raft region  --start="7480000000000000FF0C00000000000000F8"
-            cmd = f'tiup ctl:{version} tikv --host {self.address} raft region --start="{self.start_key}" --limit=100'
+            #  /opt/other-binary/tikv-ctl   --ca-path ./tls/ca.crt --cert-path ./tls/tls.crt --key-path ./tls/tls.key --host db-tikv-2.db-tikv-peer.tidb10121348356836280592.svc:20160  raft region --start="" --limit=100
+            cmd = f'{tikv_ctl}  --host {self.address} raft region --start="{self.start_key}" --limit=100'
             logger.info(f"Running command to load next regions: {cmd}") 
             result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
             regions_data = json.loads(result.stdout)
@@ -186,7 +189,7 @@ class TiKVStore:
         start_time = time.time()
         def compact_one_cf(cf):
             try:
-                compact_cmd = f'tiup ctl:{version} tikv {tls} --host {self.address} compact --bottommost force -c {cf} -r {region_id}'
+                compact_cmd = f'{tikv_ctl}  --host {self.address} compact --bottommost force -c {cf} -r {region_id}'
                 logger.debug(f"Running command to compact {cf} CF for region {region_id}: {compact_cmd}")
                 result = subprocess.run(compact_cmd, 
                             shell=True,                 
@@ -237,6 +240,7 @@ class TiKVStore:
         logger.info(f"{thread_prefix}:Thread {thread_id} started processing store {self.store_id}.")
         try:  
             while True:
+                start = time.time() 
                 regions = self.load_next_batch_regions()
                 if not regions or len(regions) == 0: 
                     break
@@ -245,7 +249,8 @@ class TiKVStore:
                     logger.info(f"{thread_prefix}: Processing region {region_id} on store {self.store_id}")
                     if self.check_and_compact_one_region(region_id):
                         compacted += 1 
-                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},compacted {compacted} regions so far." )
+                cost = time.time() - start 
+                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},cost {cost:.3f }seconds, compacted {compacted} regions so far." )
         except Exception as e:
             logger.error(f"{thread_prefix}:Unexpected error while processing store {self.store_id}: {e}")
         finally:     
@@ -286,7 +291,7 @@ def new_tikv_store_from_json(store_data,start_key):
 def process_one_store(store_id, concurrency,start_key): 
     logger.info(f"Processing store {store_id} with concurrency {concurrency}") 
     try:
-        cmd = f'tiup ctl:{version} pd -u {pd} {tls} store {store_id}'
+        cmd = f'{pd_ctl} -u {pd}  store {store_id}'
         logger.info(f"Running command: {cmd}") 
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         store_data = json.loads(result.stdout)
@@ -307,7 +312,7 @@ def process_one_store(store_id, concurrency,start_key):
 def compact_all_stores(start_key,check_stores_only):
     logger.info("Compacting all stores...") 
     try:
-        cmd = f'tiup ctl:{version} pd -u {pd} {tls} store'
+        cmd = f'{pd_ctl} -u {pd}  store'
         logger.info("Starting to get stores from PD")
         logger.info(f"Running command: {cmd}")
         # Run the shell command and capture the output
