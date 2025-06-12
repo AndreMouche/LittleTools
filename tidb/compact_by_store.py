@@ -70,13 +70,6 @@ class Statistics:
         finally:
             self.lock.release() 
 
-    def get_properties_failed(self):
-        self.lock.acquire()
-        try:
-            return self.checked_regions - self.compact_regions - self.skipped_regions
-        finally:
-            self.lock.release() 
-
     def add_skip(self):
         self.lock.acquire()
         try:
@@ -84,6 +77,52 @@ class Statistics:
         finally:
             self.lock.release() 
 
+class RegionProperties:
+    def __init__(self, region_id, mvcc_num_deletes, mvcc_num_rows, writecf_num_deletes, writecf_num_entries):
+        self.region_id = region_id
+        self.mvcc_num_deletes = mvcc_num_deletes
+        self.mvcc_num_rows = mvcc_num_rows
+        self.writecf_num_deletes = writecf_num_deletes
+        self.writecf_num_entries = writecf_num_entries
+    
+    def if_need_compact(self):
+        if self.writecf_num_entries == 0:
+            return False
+        redundant_versions = float(self.writecf_num_entries) - float(self.mvcc_num_rows) + float(self.mvcc_num_deletes)
+        if (float(redundant_versions) / float(self.writecf_num_entries) > .2 or
+            float(self.writecf_num_deletes) / float(self.writecf_num_entries) > .2):
+            return True
+        else:
+            return False
+
+# Function to get region properties from TiKV store
+def new_region_properties(region_id,store_address):
+    # Get region properties from TiKV store
+    try:
+        cmd = f'tiup ctl:{version} tikv {tls} --host {store_address} region-properties -r {region_id}'
+        logger.debug(f"Running command to get region properties for {region_id}: {cmd}") 
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) 
+        if result.returncode != 0:
+            logger.debug(f"Failed to get region properties for {region_id} on {store_address}: {result.stderr}")
+            return None
+        
+        result_dict = {}
+        for line in result.stdout.split('\n'):
+            if len(line) > 0:
+                key, value = line.split(': ')
+                result_dict[key] = value
+                logger.debug(f"{key}: {value}")
+        
+        return RegionProperties(
+            region_id,
+            float(result_dict['mvcc.num_deletes']),
+            float(result_dict['mvcc.num_rows']),
+            float(result_dict['writecf.num_deletes']),
+            float(result_dict['writecf.num_entries'])
+        )
+    except subprocess.CalledProcessError as e:
+        logger.debug(f"Failed to get region properties for {region_id} on {store_address}: {e.stderr}")
+        return None 
 
 class TiKVStore:
     def __init__(self, store_id, address,start_key):
@@ -142,60 +181,50 @@ class TiKVStore:
         finally:
             self.start_lock.release()
     
-    def check_and_compact_one_region(self, region_id):
-        try:
-            self.statitics.add_checked() 
-            cmd = f'tiup ctl:{version} tikv {tls} --host {self.address} region-properties -r {region_id}'
-            logger.debug(f"Running command to check region {region_id}: {cmd}") 
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) 
-            result_dict = {}
-            if result.returncode != 0:
-                logger.error(f"Failed to get region properties for {region_id} on {self.address}: {result.stderr}")
-                return 
-            
-            for line in result.stdout.split('\n'):
-                if len(line) > 0:
-                    key, value = line.split(': ')
-                    result_dict[key] = value
-
-            logger.debug(f"mvcc.num_deletes: {result_dict['mvcc.num_deletes']}")
-            logger.debug(f"mvcc.num_rows: {result_dict['mvcc.num_rows']}")
-            logger.debug(f"writecf.num_deletes: {result_dict['writecf.num_deletes']}")
-            logger.debug(f"writecf.num_entries: {result_dict['writecf.num_entries']}")
-            redundant_versions = float(result_dict['writecf.num_entries']) - float(result_dict['mvcc.num_rows']) + float(result_dict['mvcc.num_deletes']) 
-            if (float(redundant_versions) / float(result_dict['writecf.num_entries']) > .2 or
-                float(result_dict['writecf.num_deletes']) / float(result_dict['writecf.num_entries']) > .2):
-                self.statitics.add_compact()
-                start_time = time.time()
-                compact_write_cmd = f'tiup ctl:{version} tikv {tls} --host {self.address} compact --bottommost force -c write -r {region_id}' 
-                logger.debug(f"Running command to compact write CF for region {region_id}: {compact_write_cmd}") 
-                result = subprocess.run(compact_write_cmd, 
+    def compact_one_region(self,region_id):
+        self.statitics.add_compact()
+        start_time = time.time()
+        def compact_one_cf(cf):
+            try:
+                compact_cmd = f'tiup ctl:{version} tikv {tls} --host {self.address} compact --bottommost force -c {cf} -r {region_id}'
+                logger.debug(f"Running command to compact {cf} CF for region {region_id}: {compact_cmd}")
+                result = subprocess.run(compact_cmd, 
                             shell=True,                 
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
                 if result.returncode != 0:
-                    logger.error(f"Failed to compact write CF for region {region_id} on {self.address}: {result.stderr}")
+                    logger.error(f"Failed to compact {cf} CF for region {region_id} on {self.address}: {result.stderr}")
                     return False
-                logger.debug(f"compact write CF for region {region_id} on {self.address} completed successfully.{result.stdout}")
-
-                compact_default_cmd = f'tiup ctl:{version} tikv {tls} --host {self.address} compact --bottommost force -c default -r {region_id}'  
-                logger.debug(f"Running command to compact default CF for region {region_id}: {compact_default_cmd}")
-                result = subprocess.run(compact_default_cmd, 
-                            shell=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
-                if result.returncode != 0:
-                    logger.error(f"Failed to compact default CF for region {region_id} on {self.address}: {result.stderr}")
-                    return False
-                logger.debug(f"compact default CF for region {region_id} on {self.address} completed successfully.{result.stdout}")
-                end_time = time.time()
-                elapsed = end_time - start_time
-                logger.info(f"Compacted region {region_id} on {self.address} in {elapsed:.2f} seconds.")
-                return True 
-            else:
-                self.statitics.add_skip() 
-                logger.info(f"No need to compact {self.address} region {region_id}")
+                logger.debug(f"Compact {cf} CF for region {region_id} on {self.address} completed successfully.{result.stdout}")
+                return True
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to compact {cf} CF for region {region_id} on {self.address}: {e.stderr}")
                 return False 
+
+        write_cf = compact_one_cf("write") 
+        default_cf = compact_one_cf("default")
+        end_time = time.time()
+        logger.info(f"Compacted region {region_id} on {self.address} in {end_time - start_time:.3f} seconds. Result: Write CF: {write_cf}, Default CF: {default_cf}")
+            
+
+    def check_and_compact_one_region(self, region_id):
+        try:
+            self.statitics.add_checked() 
+            region_properties = new_region_properties(region_id, self.address) 
+            if not region_properties or region_properties.if_need_compact() == False: 
+                self.statitics.add_skip()
+                logger.info(f"Region {region_id} on {self.address} does not need compaction, skipping.")
+                return False
+            self.compact_one_region(region_id) 
+            new_properties = new_region_properties(region_id, self.address) 
+            if not new_properties or new_properties.if_need_compact() == False:
+                return True 
+
+            # TODO: check if need compact again 
+            if new_properties.mvcc_num_deletes != region_properties.mvcc_num_deletes and new_properties.mvcc_num_deletes > 1000:
+                logger.warning(f"Region {region_id} on {self.address} still has {new_properties.mvcc_num_deletes} deletes after compaction, it may need further attention.")
+                self.compact_one_region(region_id) 
+            return True 
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to process region {region_id} on {self.address}: {e.stderr}")
             return False 
@@ -235,7 +264,7 @@ class TiKVStore:
         except Exception as e:
             logger.warning(f"check_and_compact_with_concurrency:Unexpected error: {e}")
         finally:
-            logger.warning(f"Finished processing store {self.store_id}. Total regions processed: {self.statitics.checked_regions}, compacted: {self.statitics.compact_regions}, skipped: {self.statitics.skipped_regions}, properties failed: {self.statitics.get_properties_failed()}")
+            logger.warning(f"Finished processing store {self.store_id}. Total regions processed: {self.statitics.checked_regions}, compacted: {self.statitics.compact_regions}, skipped: {self.statitics.skipped_regions}")
 
 def new_tikv_store_from_json(store_data,start_key):
     store = store_data["store"]
@@ -283,7 +312,7 @@ def compact_all_stores(start_key,check_stores_only):
         logger.info(f"Running command: {cmd}")
         # Run the shell command and capture the output
         result = subprocess.run(
-            f'tiup ctl:{version} pd -u {pd} {tls} store',
+            cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -346,3 +375,4 @@ if __name__ == "__main__":
     else: 
         logger.info("Processing all stores in parallel.")
         compact_all_stores(start_key,check_stores_only=False) 
+
