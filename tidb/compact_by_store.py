@@ -103,7 +103,7 @@ def new_region_properties(region_id,store_address):
         logger.debug(f"Running command to get region properties for {region_id}: {cmd}") 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) 
         if result.returncode != 0:
-            logger.debug(f"Failed to get region properties for {region_id} on {store_address}: {result.stderr}")
+            logger.error(f"Failed to get region properties for {region_id} on {store_address}: {result.stderr}")
             return None
         
         result_dict = {}
@@ -121,7 +121,7 @@ def new_region_properties(region_id,store_address):
             float(result_dict['writecf.num_entries'])
         )
     except subprocess.CalledProcessError as e:
-        logger.debug(f"Failed to get region properties for {region_id} on {store_address}: {e.stderr}")
+        logger.error(f"Failed to get region properties for {region_id} on {store_address}: {e.stderr}")
         return None 
 
 class TiKVStore:
@@ -158,7 +158,7 @@ class TiKVStore:
                 self.start_key = region.get("end_key")  # Update start_key for next batch
                 state = region.get("state", {})
                 if state  != "Normal":
-                    logger.info(f"Skipping region {region_id} in store {self.store_id} due to state: {state}")
+                    logger.debug(f"Skipping region {region_id} in store {self.store_id} due to state: {state}")
                     continue
                 if region_id:
                     region_ids.append(region_id)
