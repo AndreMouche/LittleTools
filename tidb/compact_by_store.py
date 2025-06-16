@@ -8,6 +8,21 @@
 # Warning: It will get all regions for each store from PD which may have a performance impact on PD
 # Usage:
 # python compact_by_store.py --pd "127.0.0.1:2379" --version "v7.5.2" --store-id 0 --concurrency 4
+#usage: compact_by_store.py [-h] [--pd PD] [--version VERSION] [--store-id STORE_ID] [--start-key START_KEY] [--end-key END_KEY] [--concurrency CONCURRENCY]
+# Compact TiKV regions by store ID or all stores in parallel.
+
+# optional arguments:
+#   -h, --help            show this help message and exit
+#   --pd PD               PD address (default:127.0.0.1:2379)
+#   --version VERSION     TiKV version (default:v7.5.2)
+#   --store-id STORE_ID   Store ID to process (default:-1. list storeinfo only) 0 means process all stores in parallel
+#   --start-key START_KEY
+#                         Start key for regions to compact (default: empty string)
+#   --end-key END_KEY     End key for regions to compact (default: empty string)
+#   --concurrency CONCURRENCY, -c CONCURRENCY
+#                         Number of concurrent threads per store (default:2)
+# #
+
 
 import time
 import os
