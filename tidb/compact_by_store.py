@@ -18,6 +18,7 @@ import argparse
 from threading import Thread
 #import questionary
 import threading
+import heapq 
 
 
 parser = argparse.ArgumentParser(description='Compact TiKV regions by store ID or all stores in parallel.')
@@ -25,6 +26,7 @@ parser.add_argument('--pd', type=str, default='127.0.0.1:2379', help='PD address
 parser.add_argument('--version', type=str, default='v7.5.2', help='TiKV version (default:v7.5.2)') 
 parser.add_argument('--store-id', type=int, default="-1", help='Store ID to process (default:-1. list storeinfo only) 0 means process all stores in parallel ') 
 parser.add_argument('--start-key', type=str, default="", help='Start key for regions to compact (default: empty string)')
+parser.add_argument('--end-key', type=str, default="", help='End key for regions to compact (default: empty string)') 
 parser.add_argument('--concurrency', "-c",type=int, default=2, help='Number of concurrent threads per store (default:2)')
 
 
@@ -97,6 +99,78 @@ class RegionProperties:
         else:
             return False
 
+class Region: 
+    def __init__(self, region_id, start_key, end_key):
+        self.region_id = region_id
+        self.start_key = start_key
+        self.end_key = end_key 
+    
+    def __lt__(self, other):
+        return self.start_key < other.start_key 
+
+class StoreRegions:
+    def __init__(self, store_id,address,start_key,end_key):
+        self.store_id = store_id
+        self.start_key = start_key 
+        self.end_key = end_key
+        self.address = address 
+        self.lock = threading.Lock() 
+        self.regions = [] 
+    
+    def load_all_regions(self):
+        start_time = time.time() 
+        thread_prefix = f"{self.store_id}_thread_load_all_regions"
+        # Load all regions from TiKV store 
+        # tiup ctl:v7.5.2 tikv --host ' 
+        try:
+            # tiup ctl:v7.5.2 tikv --host '127.0.0.1:20161' raft region  --start="7480000000000000FF0C00000000000000F8"
+            #  /opt/other-binary/tikv-ctl   --ca-path ./tls/ca.crt --cert-path ./tls/tls.crt --key-path ./tls/tls.key --host db-tikv-2.db-tikv-peer.tidb10121348356836280592.svc:20160  raft region --start="" --limit=100
+            cmd = f'{tikv_ctl}  --host {self.address} raft region --all-regions --skip-tombstone --start="{self.start_key}" --end="{self.end_key}" --limit=0' 
+            logger.info(f"{thread_prefix} Running command to load all regions: {cmd}") 
+
+            result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+            regions_data = json.loads(result.stdout)
+            if not regions_data or not regions_data.get("region_infos"):
+                logger.info(f"{thread_prefix} No more regions to process for store {self.store_id}.")
+                return None 
+            
+            logger.info(f"{thread_prefix} Loaded {len(regions_data.get('region_infos'))} regions for store {self.store_id},cost {time.time() - start_time:.3f} seconds.") 
+            for region_id,region_info in regions_data.get("region_infos").items():
+                region = region_info.get("region_local_state", {}).get("region",{})
+                logger.debug(f"{thread_prefix} region:{region}")
+                start_key = region.get("start_key", "") 
+                end_key = region.get("end_key")  
+                state = region.get("state", {})
+                if state  != "Normal":
+                    logger.debug(f"{thread_prefix} Skipping region {region_id} in store {self.store_id} due to state: {state}")
+                    continue
+                cur_region = Region(region_id, start_key, end_key) 
+                heapq.heappush(self.regions, cur_region)  # Use heapq to maintain sorted order by start_key 
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"{thread_prefix} Command failed with error:\n{e.stderr}")
+            self.finished = True
+        except json.JSONDecodeError:
+            logger.warning("{thread_prefix} Failed to parse JSON output.")
+            self.finished = True
+        except Exception as e:
+            logger.warning(f"{thread_prefix} maybe no more regions:Unexpected error: {e}")
+            self.finished = True
+        finally:
+            logger.info(f"{thread_prefix} Finished loading and sorting all regions for store {self.store_id}. Total regions loaded: {len(self.regions)},cost {time.time() - start_time:.3f} seconds.")
+
+    def load_next_batch_regions(self,limit=100): 
+        self.lock.acquire() 
+        try:
+            regions = [] 
+            while self.regions:
+                region = heapq.heappop(self.regions) 
+                regions.append(region) 
+                if len(regions) >= limit:
+                    break 
+            return regions 
+        finally:
+            self.lock.release() 
+        
 # Function to get region properties from TiKV store
 def new_region_properties(region_id,store_address,thread_prefix):
     # Get region properties from TiKV store
@@ -127,63 +201,12 @@ def new_region_properties(region_id,store_address,thread_prefix):
         return None 
 
 class TiKVStore:
-    def __init__(self, store_id, address,start_key):
+    def __init__(self, store_id, address,start_key,end_key):
         self.store_id = store_id
         self.address = address
         self.statitics = Statistics() 
         self.start_time = time.time() 
-        self.start_lock = threading.Lock()
-        self.start_key = start_key
-        self.finished = False
-
-    def load_next_batch_regions(self,thread_prefix):
-        self.start_lock.acquire()
-        try:
-            if self.finished == True: 
-                logger.info(f"{thread_prefix} Store {self.store_id} has finished processing.")
-                return None
-            # Load next batch of regions from TiKV store 
-            # tiup ctl:v7.5.2 tikv --host '127.0.0.1:20161' raft region  --start="7480000000000000FF0C00000000000000F8"
-            #  /opt/other-binary/tikv-ctl   --ca-path ./tls/ca.crt --cert-path ./tls/tls.crt --key-path ./tls/tls.key --host db-tikv-2.db-tikv-peer.tidb10121348356836280592.svc:20160  raft region --start="" --limit=100
-            cmd = f'{tikv_ctl}  --host {self.address} raft region --skip-tombstone --start="{self.start_key}" --limit=100' 
-            logger.info(f"{thread_prefix} Running command to load next regions: {cmd}") 
-
-            result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-            regions_data = json.loads(result.stdout)
-            if not regions_data or not regions_data.get("region_infos"):
-                self.finished = True 
-                logger.info(f"{thread_prefix} No more regions to process for store {self.store_id}.")
-                return None 
-            
-            region_ids = []
-            for region_id,region_info in regions_data.get("region_infos").items():
-                region = region_info.get("region_local_state", {}).get("region",{})
-                logger.debug(f"{thread_prefix} region:{region}")
-                self.start_key = region.get("end_key")  # Update start_key for next batch
-                state = region.get("state", {})
-                if state  != "Normal":
-                    logger.debug(f"{thread_prefix} Skipping region {region_id} in store {self.store_id} due to state: {state}")
-                    continue
-                if region_id:
-                    region_ids.append(region_id)
-                    
-                
-            if self.start_key == "":
-                self.finished = True 
-            logger.info(f"{thread_prefix} Loaded {len(region_ids)} regions for store {self.store_id} next start-key {self.start_key}.")
-        
-            return region_ids 
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"{thread_prefix} Command failed with error:\n{e.stderr}")
-            self.finished = True
-        except json.JSONDecodeError:
-            logger.warning("{thread_prefix} Failed to parse JSON output.")
-            self.finished = True
-        except Exception as e:
-            logger.warning(f"{thread_prefix} maybe no more regions:Unexpected error: {e}")
-            self.finished = True
-        finally:
-            self.start_lock.release()
+        self.regions = StoreRegions(store_id,address,start_key,end_key)  
     
     def compact_one_region(self,region_id,thread_prefix):
         self.statitics.add_compact()
@@ -242,16 +265,18 @@ class TiKVStore:
         try:  
             while True:
                 start = time.time() 
-                regions = self.load_next_batch_regions(thread_prefix)
+                regions = self.regions.load_next_batch_regions(limit=100) 
                 if not regions or len(regions) == 0: 
                     break
                 total += len(regions) 
-                for region_id in regions:
+                for region in regions:
+                    region_id = region.region_id 
                     logger.info(f"{thread_prefix}: Processing region {region_id} on store {self.store_id}")
                     if self.check_and_compact_one_region(region_id,thread_prefix):
                         compacted += 1 
                 cost = time.time() - start 
-                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},cost {cost:.3f}seconds, compacted {compacted} regions so far." )
+                last_key = regions[-1].end_key if regions else "N/A" 
+                logger.warning(f"{thread_prefix}: Processed {len(regions)} regions for store {self.store_id},cost {cost:.3f}seconds, compacted {compacted} regions so far. last end-key:{last_key}" )
         except Exception as e:
             logger.error(f"{thread_prefix}:Unexpected error while processing store {self.store_id}: {e}")
         finally:     
@@ -259,6 +284,7 @@ class TiKVStore:
 
     def check_and_compact_with_concurrency(self, concurrency=2):
         try:
+            self.regions.load_all_regions() 
             logger.info(f"Starting to process store {self.store_id} with concurrency {concurrency}")
             threads = []
             for id in range(concurrency):
@@ -272,7 +298,7 @@ class TiKVStore:
         finally:
             logger.warning(f"Finished processing store {self.store_id}. Total regions processed: {self.statitics.checked_regions}, compacted: {self.statitics.compact_regions}, skipped: {self.statitics.skipped_regions}")
 
-def new_tikv_store_from_json(store_data,start_key):
+def new_tikv_store_from_json(store_data,start_key,end_key):
     store = store_data["store"]
     store_id = store.get("id")
     store_address = store.get("address") 
@@ -288,16 +314,16 @@ def new_tikv_store_from_json(store_data,start_key):
             else:
                 break
     logger.info(f"New TiKV store {store_id} , address {store_address}, region count {region_count}") 
-    return TiKVStore(store_id, store_address,start_key)
+    return TiKVStore(store_id, store_address,start_key,end_key)
 
-def process_one_store(store_id, concurrency,start_key): 
+def process_one_store(store_id, concurrency,start_key,end_key): 
     logger.info(f"Processing store {store_id} with concurrency {concurrency}") 
     try:
         cmd = f'{pd_ctl} -u {pd}  store {store_id}'
         logger.info(f"Running command: {cmd}") 
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         store_data = json.loads(result.stdout)
-        tikv_store = new_tikv_store_from_json(store_data,start_key)
+        tikv_store = new_tikv_store_from_json(store_data,start_key,end_key)
         if not tikv_store:
             logger.warning(f"Store {store_id} is a TiFlash store or not found, skipping.")
             return
@@ -311,7 +337,7 @@ def process_one_store(store_id, concurrency,start_key):
     
 
 # Function to compact all stores in parallel
-def compact_all_stores(start_key,check_stores_only):
+def compact_all_stores(start_key,end_key,check_stores_only):
     logger.info("Compacting all stores...") 
     try:
         cmd = f'{pd_ctl} -u {pd}  store --state="Up"'
@@ -335,7 +361,7 @@ def compact_all_stores(start_key,check_stores_only):
 
         stores = []
         for store_info in data.get("stores", []):
-            store = new_tikv_store_from_json(store_info,start_key)
+            store = new_tikv_store_from_json(store_info,start_key,end_key)
             if store:
                 stores.append(store) 
 
@@ -372,14 +398,19 @@ if __name__ == "__main__":
         logger.info(f"Using start key: {start_key}")
     else:
         logger.info("No start key provided, will start from the beginning.")
+    end_key = args.end_key 
+    if end_key:
+        logger.info(f"Using end key: {end_key}")
+    else:
+        logger.info("No end key provided, will process until the end.") 
     if  store_id < 0:
-        compact_all_stores(start_key,check_stores_only=True)
+        compact_all_stores(start_key,end_key,check_stores_only=True)
         logger.error("Invalid store ID provided. Please provide a valid store ID or 0 to compact all stores.")
         sys.exit(1)
     if store_id > 0:
         logger.info(f"Processing single store with ID: {store_id}")
-        process_one_store(store_id, thread_per_store,start_key)
+        process_one_store(store_id, thread_per_store,start_key,end_key)
     else: 
         logger.info("Processing all stores in parallel.")
-        compact_all_stores(start_key,check_stores_only=False) 
+        compact_all_stores(start_key,end_key,check_stores_only=False) 
 
