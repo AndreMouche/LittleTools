@@ -114,10 +114,11 @@ class StoreRegions:
         self.start_key = start_key 
         self.end_key = end_key
         self.address = address 
-        self.lock = threading.Lock() 
+        self.lock = threading.Lock()
+        self.batch_limit = 100  
         self.regions = [] 
     
-    def load_all_regions(self):
+    def load_all_regions(self,concurrency):
         start_time = time.time() 
         thread_prefix = f"{self.store_id}_thread_load_all_regions"
         # Load all regions from TiKV store 
@@ -134,7 +135,11 @@ class StoreRegions:
                 logger.info(f"{thread_prefix} No more regions to process for store {self.store_id}.")
                 return None 
             
-            logger.info(f"{thread_prefix} Loaded {len(regions_data.get('region_infos'))} regions for store {self.store_id},cost {time.time() - start_time:.3f} seconds.") 
+            total_regions = len(regions_data.get("region_infos")) 
+            if total_regions/concurrency < self.batch_limit:
+                self.batch_limit = int(total_regions/concurrency) + 1 
+
+            logger.info(f"{thread_prefix} Loaded {total_regions} regions for store {self.store_id},cost {time.time() - start_time:.3f} seconds. Batch limit set to {self.batch_limit} with concurrency:{concurrency}.") 
             for region_id,region_info in regions_data.get("region_infos").items():
                 region = region_info.get("region_local_state", {}).get("region",{})
                 logger.debug(f"{thread_prefix} region:{region}")
@@ -158,14 +163,14 @@ class StoreRegions:
         finally:
             logger.info(f"{thread_prefix} Finished loading and sorting all regions for store {self.store_id}. Total regions loaded: {len(self.regions)},cost {time.time() - start_time:.3f} seconds.")
 
-    def load_next_batch_regions(self,limit=100): 
+    def load_next_batch_regions(self): 
         self.lock.acquire() 
         try:
             regions = [] 
             while self.regions:
                 region = heapq.heappop(self.regions) 
                 regions.append(region) 
-                if len(regions) >= limit:
+                if len(regions) >= self.batch_limit:
                     break 
             return regions 
         finally:
@@ -265,7 +270,7 @@ class TiKVStore:
         try:  
             while True:
                 start = time.time() 
-                regions = self.regions.load_next_batch_regions(limit=100) 
+                regions = self.regions.load_next_batch_regions() 
                 if not regions or len(regions) == 0: 
                     break
                 total += len(regions) 
@@ -284,7 +289,7 @@ class TiKVStore:
 
     def check_and_compact_with_concurrency(self, concurrency=2):
         try:
-            self.regions.load_all_regions() 
+            self.regions.load_all_regions(concurrency) 
             logger.info(f"Starting to process store {self.store_id} with concurrency {concurrency}")
             threads = []
             for id in range(concurrency):
