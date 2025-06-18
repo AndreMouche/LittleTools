@@ -105,10 +105,13 @@ class RegionProperties:
         self.writecf_num_deletes = writecf_num_deletes
         self.writecf_num_entries = writecf_num_entries
     
+    def redundant_versions(self): 
+        return float(self.writecf_num_entries) - float(self.mvcc_num_rows) + float(self.mvcc_num_deletes) 
+
     def if_need_compact(self):
         if self.writecf_num_entries == 0:
             return False
-        redundant_versions = float(self.writecf_num_entries) - float(self.mvcc_num_rows) + float(self.mvcc_num_deletes)
+        redundant_versions = self.redundant_versions()
         if (float(redundant_versions) / float(self.writecf_num_entries) > .2 or
             float(self.writecf_num_deletes) / float(self.writecf_num_entries) > .2):
             return True
@@ -265,12 +268,14 @@ class TiKVStore:
                 return False
             self.compact_one_region(region_id,thread_prefix) 
             new_properties = new_region_properties(region_id, self.address,thread_prefix) 
+             
             if not new_properties or new_properties.if_need_compact() == False:
                 return True 
 
+            remove_redundant_versions = new_properties.redundant_versions() - region_properties.redundant_versions()
             # TODO: check if need compact again 
             if new_properties.mvcc_num_deletes != region_properties.mvcc_num_deletes and new_properties.mvcc_num_deletes > 1000:
-                logger.warning(f"{thread_prefix} Region {region_id} on {self.address} still has {new_properties.mvcc_num_deletes} deletes after compaction, it may need further attention.")
+                logger.warning(f"{thread_prefix} Region {region_id} on {self.address} released {remove_redundant_versions} versions, and still has {new_properties.mvcc_num_deletes} deletes after compaction, it may need further attention.")
                 self.compact_one_region(region_id,thread_prefix) 
             return True 
         except subprocess.CalledProcessError as e:
