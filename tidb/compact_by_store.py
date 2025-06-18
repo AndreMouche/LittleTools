@@ -21,6 +21,7 @@
 #   --end-key END_KEY     End key for regions to compact (default: empty string)
 #   --concurrency CONCURRENCY, -c CONCURRENCY
 #                         Number of concurrent threads per store (default:2)
+#   TODO: fix https://github.com/tikv/tikv/issues/18566 
 # #
 
 
